@@ -1,68 +1,78 @@
 #include "CameraServiceExtFactory.h"
 #include <dlfcn.h>
 #include <log/log.h>
+#include <mutex>
 
 namespace android {
+
+namespace {
+
+std::once_flag gLoadOnce;
+std::once_flag gObjectOnce;
+
+} // namespace
 
 void* CameraServiceExtFactory::sFunctionTable = nullptr;
 void* CameraServiceExtFactory::sExtObject = nullptr;
 int (*CameraServiceExtFactory::sOnTransactFunc)(void*, uint32_t, const Parcel&, Parcel*, uint32_t) = nullptr;
 
 void CameraServiceExtFactory::ensureLoaded() {
-    if (sFunctionTable != nullptr) return;
+    std::call_once(gLoadOnce, []() {
+        const char* libPath = "system_ext/lib64/libcsextimpl.so";
+        void* handle = dlopen(libPath, RTLD_NOW);
+        if (handle == nullptr) {
+            ALOGI("CameraServiceExtFactory: optional extension unavailable: %s", dlerror());
+            return;
+        }
+        ALOGI("CameraServiceExtFactory: dlopen succeeded, handle=%p", handle);
 
-    const char* libPath = "system_ext/lib64/libcsextimpl.so";
-    void* handle = dlopen(libPath, RTLD_NOW);
-    if (handle == nullptr) {
-        ALOGE("CameraServiceExtFactory: dlopen failed: %s", dlerror());
-        return;
-    }
-    ALOGI("CameraServiceExtFactory: dlopen succeeded, handle=%p", handle);
+        typedef void* (*GetFactoryFunc)();
+        GetFactoryFunc getExtFactoryImpl =
+                reinterpret_cast<GetFactoryFunc>(dlsym(handle, "getExtFactoryImpl"));
+        if (getExtFactoryImpl == nullptr) {
+            ALOGE("CameraServiceExtFactory: dlsym getExtFactoryImpl failed: %s", dlerror());
+            dlclose(handle);
+            return;
+        }
+        ALOGI("CameraServiceExtFactory: getExtFactoryImpl at %p", getExtFactoryImpl);
 
-    typedef void* (*GetFactoryFunc)();
-    GetFactoryFunc getExtFactoryImpl = (GetFactoryFunc)dlsym(handle, "getExtFactoryImpl");
-    if (getExtFactoryImpl == nullptr) {
-        ALOGE("CameraServiceExtFactory: dlsym getExtFactoryImpl failed: %s", dlerror());
-        dlclose(handle);
-        return;
-    }
-    ALOGI("CameraServiceExtFactory: getExtFactoryImpl at %p", getExtFactoryImpl);
+        // Triple indirection as determined from logs: getExtFactoryImpl returns ptr to ptr to ptr to function
+        void* ptrToPtr = getExtFactoryImpl();
+        if (ptrToPtr == nullptr) {
+            ALOGE("CameraServiceExtFactory: getExtFactoryImpl returned null");
+            dlclose(handle);
+            return;
+        }
 
-    // Triple indirection as determined from logs: getExtFactoryImpl returns ptr to ptr to ptr to function
-    void* ptrToPtr = getExtFactoryImpl();
-    if (ptrToPtr == nullptr) {
-        ALOGE("CameraServiceExtFactory: getExtFactoryImpl returned null");
-        dlclose(handle);
-        return;
-    }
+        void* ptrToFunc = *reinterpret_cast<void**>(ptrToPtr);
+        if (ptrToFunc == nullptr) {
+            ALOGE("CameraServiceExtFactory: first deref gave null");
+            dlclose(handle);
+            return;
+        }
 
-    void* ptrToFunc = *(void**)ptrToPtr;
-    if (ptrToFunc == nullptr) {
-        ALOGE("CameraServiceExtFactory: first deref gave null");
-        dlclose(handle);
-        return;
-    }
+        void* actualFunc = *reinterpret_cast<void**>(ptrToFunc);
+        if (actualFunc == nullptr) {
+            ALOGE("CameraServiceExtFactory: second deref gave null");
+            dlclose(handle);
+            return;
+        }
+        ALOGI("CameraServiceExtFactory: actual factory function at %p", actualFunc);
 
-    void* actualFunc = *(void**)ptrToFunc;
-    if (actualFunc == nullptr) {
-        ALOGE("CameraServiceExtFactory: second deref gave null");
-        dlclose(handle);
-        return;
-    }
-    ALOGI("CameraServiceExtFactory: actual factory function at %p", actualFunc);
+        sFunctionTable = operator new(sizeof(void*));
+        *reinterpret_cast<void**>(sFunctionTable) = actualFunc;
+        ALOGI("CameraServiceExtFactory: function table at %p", sFunctionTable);
 
-    sFunctionTable = operator new(8);
-    *(void**)sFunctionTable = actualFunc;
-    ALOGI("CameraServiceExtFactory: function table at %p", sFunctionTable);
-
-    // Resolve onTransact (for direct call via vtable)
-    sOnTransactFunc = (int (*)(void*, uint32_t, const Parcel&, Parcel*, uint32_t))
-        dlsym(handle, "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j");
-    if (sOnTransactFunc == nullptr) {
-        ALOGE("CameraServiceExtFactory: dlsym onTransact failed: %s", dlerror());
-    } else {
-        ALOGI("CameraServiceExtFactory: onTransact found at %p", sOnTransactFunc);
-    }
+        // Resolve onTransact (for direct call via vtable)
+        sOnTransactFunc = reinterpret_cast<decltype(sOnTransactFunc)>(
+                dlsym(handle,
+                      "_ZN7android20CameraServiceExtImpl10onTransactEjRKNS_6ParcelEPS1_j"));
+        if (sOnTransactFunc == nullptr) {
+            ALOGE("CameraServiceExtFactory: dlsym onTransact failed: %s", dlerror());
+        } else {
+            ALOGI("CameraServiceExtFactory: onTransact found at %p", sOnTransactFunc);
+        }
+    });
 }
 
 void* CameraServiceExtFactory::getInstance() {
@@ -72,26 +82,25 @@ void* CameraServiceExtFactory::getInstance() {
 
 int CameraServiceExtFactory::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
     ensureLoaded();
-    if (sExtObject == nullptr) {
-        if (sFunctionTable == nullptr) {
-            ALOGE("CameraServiceExtFactory::onTransact: extension not loaded");
-            return -1;
-        }
-        void* actualFunc = *(void**)sFunctionTable;
-        if (actualFunc == nullptr) return -1;
-        typedef void* (*GetObjectFunc)();
-        sExtObject = ((GetObjectFunc)actualFunc)();
-        if (sExtObject == nullptr) {
-            ALOGE("CameraServiceExtFactory: factory returned null");
-            return -1;
-        }
-        ALOGI("CameraServiceExtFactory: real extension object at %p", sExtObject);
-    }
-
-    if (sOnTransactFunc == nullptr) {
-        ALOGE("CameraServiceExtFactory::onTransact: no function pointer");
+    if (sFunctionTable == nullptr || sOnTransactFunc == nullptr) {
         return -1;
     }
+
+    std::call_once(gObjectOnce, []() {
+        void* actualFunc = *reinterpret_cast<void**>(sFunctionTable);
+        if (actualFunc == nullptr) return;
+
+        typedef void* (*GetObjectFunc)();
+        sExtObject = reinterpret_cast<GetObjectFunc>(actualFunc)();
+        if (sExtObject == nullptr) {
+            ALOGE("CameraServiceExtFactory: factory returned null");
+        } else {
+            ALOGI("CameraServiceExtFactory: real extension object at %p", sExtObject);
+        }
+    });
+
+    if (sExtObject == nullptr) return -1;
+
     return sOnTransactFunc(sExtObject, code, data, reply, flags);
 }
 
